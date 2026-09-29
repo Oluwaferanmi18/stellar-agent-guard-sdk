@@ -33,10 +33,13 @@ export {
   GuardBlockedError,
   ACCOUNT_STATE_REASONS,
   GUARD_REASON_CODES,
+  GUARD_REASONS,
   explainReason,
+  isGuardReason,
   reasonName,
   reasonNameFromCode,
   type GuardBlockedErrorParams,
+  type GuardReason,
   type GuardReasonName,
 } from "./reasons.ts";
 
@@ -84,6 +87,7 @@ export {
   type InvokePipelineStep,
   type InvokeParams,
   type InvokeStepEvent,
+  type RetryableInvokeFailure,
 } from "./invoke.ts";
 
 export {
@@ -118,10 +122,12 @@ export {
   formatFee,
   precheckCost,
   precheckCostWithDecision,
+  resourceBreakdownFromSimulation,
   type CostDecision,
   type CostPreCheckConfig,
   type CostWithDecision,
   type FeeBreakdown,
+  type ResourceBreakdown,
 } from "./cost.ts";
 
 export {
@@ -133,16 +139,21 @@ export {
   guardEventId,
   guardEventsFromDiagnostics,
   isAllowedDecision,
+  mergeGuardEventStreams,
   telemetryFromDecision,
+  type GuardDiagnosticBatch,
   type GuardEvent,
   type GuardEventContext,
   type GuardEventIdentityInput,
   type GuardEventKind,
+  type GuardEventStream,
   type GuardTelemetryConfig,
   type GuardTelemetryGap,
   type GuardTelemetryGapReason,
+  type GuardTelemetryUnifiedParams,
   type GuardTelemetryWatchParams,
   type PollResult,
+  type PollSleep,
   type TelemetryJitter,
 } from "./telemetry.ts";
 
@@ -156,6 +167,7 @@ export {
   describeSimulationResources,
   describeSubmissionFailure,
   describeTransactionResult,
+  isSequenceNumberFailure,
   isStaleLedgerResourceFailure,
   keypairAgentSigner,
   toAgentSigner,
@@ -200,4 +212,3 @@ export {
   type ElizaGuardOptions,
   type ElizaValidator,
 } from "./adapters/elizaos.ts";
-

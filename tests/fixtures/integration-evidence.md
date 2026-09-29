@@ -447,6 +447,60 @@ suite, and it needs the contract-side `check_batch` entrypoint to compare agains
 
 **A maintainer with `.env.phase2` should run `npm run test:integration` against this branch before merge** and replace this addendum with the fresh run output.
 
+## Addendum — 2026-09-27 (PR #177: simulation resource breakdown on `CostPreChecker`)
+
+Recorded because this PR touches the enforcement path (`src/preflight.ts`) and CI's
+`enforcement-path evidence gate` therefore requires this file in the diff.
+
+**It is not accompanied by a fresh live-testnet run**: `.env.phase2` is absent from
+this checkout, so `npm run test:integration` cannot execute here.
+
+### Summary of changes to the enforcement path
+
+- `src/preflight.ts`: an admissible decision now carries an optional
+  `resourceBreakdown`, parsed from the *same* enforced simulation that already
+  produced `estimatedResourceFee`. `footprintKeys` prefers
+  `breakdown.storageEntries` when the payload exposes a complete resource block and
+  otherwise falls back to the existing `getReadOnly()`/`getReadWrite()` count, so
+  the reported key count is unchanged wherever the parse does not succeed.
+- `src/cost.ts`: adds `ResourceBreakdown` and `resourceBreakdownFromSimulation()`,
+  which reads the actual `SorobanResources` fields (`instructions`,
+  `diskReadBytes`, `writeBytes`) and the footprint array lengths. A missing or
+  malformed field yields `undefined` for the whole breakdown — no zero-filling. The
+  parsed value is surfaced on priced `within_budget`/`over_budget` results as
+  `breakdown`.
+
+Unchanged, deliberately: the authorization preimage and nonce policy, credential
+kinds answered, the probe → sign → enforced-simulation ordering, resource
+assembly, submission, block classification, and every existing outcome value. The
+breakdown is read *out of* the simulation the guard already runs; it does not add
+an RPC call, does not alter what is signed, and cannot change a verdict.
+
+This diff sits alongside two already-merged changes that touch the same file: the
+batched pre-flight staging above (`src/preflight.ts`, `src/policy.ts`) and the
+bounded stale-ledger retry (`src/invoke.ts`). They are independent —
+`checkBatch` consumes only a verdict's `kind`, and this change only adds a field to
+the `admissible` arm — but the merged tree type-checks and the full suite runs on
+all three together, which is the state the numbers below describe.
+
+### What did run locally (Node 24.16.0)
+
+```text
+npm run typecheck                        # clean
+npm run lint                             # clean
+npm test                                 # 257 unit tests passing, 0 fail
+npm run build                            # clean
+npm run test:smoke                       # 73 exports resolve via the ESM export map
+```
+
+The new coverage for this change is `tests/unit/cost.test.ts` against the committed
+recorded payload fixture `tests/fixtures/simulation-resource-payload.json`: the
+wire-shape `SorobanResources` object, the parsed `SorobanDataBuilder` value, the
+raw base64 form, incomplete-payload handling (whole result `undefined`), and
+propagation through `CostPreChecker`. No network, no credentials.
+
+**A maintainer with `.env.phase2` should run `npm run test:integration` against this branch before merge** and replace this addendum with the fresh run output.
+
 
 
 ## 2026-09-28 — merge of `main` into the policy/dry-run/auth branch, and its re-validation
@@ -532,3 +586,82 @@ Phase-2 transcript is claimed. The merged tree adds `onStep` observability and a
 bounded jittered retry to the same path the live suite exercises, so the five recorded
 scenarios above should be re-run by a maintainer holding credentials before merge.
 That is an argument, not a measurement, and this section does not present it as one.
+
+## Addendum — 2026-09-29 (PR #169: per-account invoke queue and sequence reservation)
+
+Recorded because this PR touches the enforcement path (`src/tx.ts`, `src/invoke.ts`)
+and CI's `enforcement-path evidence gate` therefore requires this file in the diff.
+
+**It is not accompanied by a fresh live-testnet run**: this checkout has no
+`.env.phase2` credentials, so `npm run test:integration` cannot begin its
+scenarios. No fresh Phase-2 transcript is claimed below. The CI gate verifies
+only that this file was touched, not the numbers, and the same limitation stated
+in every addendum above applies here unchanged.
+
+### What the PR changes on the enforcement path
+
+This PR makes concurrent `invoke()` calls safe for one source account, and
+nothing else on that path moves.
+
+- `src/tx.ts`: adds `isSequenceNumberFailure()`, a deliberately narrow classifier
+  for a submission rejected for a stale/duplicate account sequence (`tx_bad_seq`
+  and its prose variants). It sits next to `isStaleLedgerResourceFailure()` and
+  follows the same shape. No existing function is modified, so the stale-ledger
+  classifier the five scenarios above depend on is byte-identical.
+- `src/invoke.ts`: adds a per-(server, account) serialization queue, so a whole
+  invocation — fetch, build, simulate, **and submit** — runs one at a time per
+  source account, plus a monotonic sequence reservation that advances past an
+  RPC snapshot which has not yet observed the preceding submission. A
+  `tx_bad_seq` outcome is classified as `retryable: "sequence_number_collision"`
+  and re-runs the full pipeline against a refreshed account snapshot.
+- `src/index.ts`: exports `isSequenceNumberFailure` and the
+  `RetryableInvokeFailure` type.
+
+Unchanged, deliberately: the authorization preimage and nonce policy, credential
+kinds answered, the probe → sign → enforced-simulation ordering, resource
+assembly, submission, block classification, and every outcome value and detail
+string. The queue releases in `finally`, so a failed transaction cannot strand
+later calls, and the reservation is scoped to the RPC server object as well as
+the account key so the same account on two networks does not share state.
+
+### The one behavioural change a reviewer should actually weigh
+
+The retry predicate widened. Before this PR only `stale_ledger_resource_limit`
+was retryable; now any outcome carrying a `retryable` tag is, which adds
+`sequence_number_collision`. A transaction rejected for a bad sequence applies
+nothing, so retrying it is safe on the same grounds as the stale-ledger case
+argued above. It is deliberately **not** extended to `Auth` failures — those are
+the guard refusing, and retrying a block would be wrong. Both directions are
+pinned in `tests/unit/tx.test.ts`: `tx_bad_seq` and prose mismatches classify as
+sequence failures, and an unrelated `tx_insufficient_fee` does not.
+
+The one case this cannot fully settle offline: when a sequence collision is
+caused by *another process* broadcasting for the same account, the reservation
+keeps advancing and each retry re-fetches. The unit test for this asserts the
+observable contract — two serialized envelopes, sequences 8 and 9, from a mock
+whose `getAccount` never advances — but whether that holds against real
+concurrent writers needs the live suite.
+
+### What did run locally
+
+```text
+npm run typecheck                        # clean
+npm run lint                             # clean
+npm test                                 # 294 unit tests passing, 0 fail
+npm run build                            # clean
+npm run test:smoke                       # 82 exports resolve via the ESM export map
+node --import tsx scripts/check-enforcement-evidence.ts upstream/main HEAD
+                                        # pass; evidence file detected as updated
+```
+
+`tests/unit/invoke.test.ts` gains a "invoke sequence reservation" suite driving
+the real pipeline against a mocked RPC: a `tx_bad_seq` first send followed by a
+successful retry, and two concurrent invocations proven serialized with distinct
+envelope sequences. These are mocks. They pin the client-side ordering
+guarantee; they cannot substitute for the live run, and this addendum does not
+claim they do.
+
+**A maintainer with `.env.phase2` should run `npm run test:integration` against
+this branch before merge** and replace this addendum with the fresh run output.
+No credentials, deployment or policy change are needed beyond what the suite
+already does.
