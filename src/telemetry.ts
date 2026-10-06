@@ -35,6 +35,7 @@ import { createHash } from "node:crypto";
 import { rpc, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk";
 import { GUARD_AUTH_RESULTS, GUARD_EVENT_TOPICS, decodeAuthDecision, normalizeEventData, type GuardAuthDecision } from "./events.ts";
 import { topicSymbols } from "./invoke.ts";
+import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
 
 /** The event name topics this SDK knows how to interpret. */
 const KNOWN_TOPICS = new Set<string>(Object.values(GUARD_EVENT_TOPICS));
@@ -110,6 +111,45 @@ export interface GuardEvent {
   decision: GuardAuthDecision | null;
   /** Decoded event data: `{ at }` for a heartbeat, `{ by }` for admin events. */
   data: unknown;
+  /**
+   * The undecoded source event, present only when the decode was asked for it
+   * with `includeRaw: true` (issue #94). Absent — not merely `null` — otherwise,
+   * so a runtime that does not want the payload does not retain it.
+   *
+   * The value is what was available at the decode site, which differs per
+   * stream: a **diagnostic** keeps the host-shaped event object the RPC
+   * returned (`{ event: { contractId, body: { v0: { topics: ScVal[], data } } }
+   * }`), and a **ledger** event keeps the `rpc.Api.EventResponse` object from
+   * `getEvents` (`topic: ScVal[]`, `value: ScVal`, `txHash`, …). Neither is a
+   * base64 blob — the SDK never re-serialises it, so what a consumer files in a
+   * bug report is the object the SDK actually saw.
+   *
+   * **Memory:** this holds a reference to the source payload (including its
+   * `xdr.ScVal`s) for as long as the `GuardEvent` lives, and, when the listener's
+   * ring buffer is enabled, for as long as that buffer retains the event. That is
+   * why it is opt-in and off by default; turn it on for the debugging session or
+   * the bug-report window, not for a long-running fleet.
+   */
+  raw?: unknown;
+}
+
+/**
+ * Decode-time options shared by every entry point that produces `GuardEvent`s.
+ */
+export interface GuardEventDecodeOptions {
+  /**
+   * Opt-in retention of the undecoded source event on each decoded event's
+   * `raw` field (issue #94). Default `false`: the raw payload is discarded as
+   * soon as it has been decoded, which is the memory discipline the default
+   * path has always had. When `false`, `raw` is absent (undefined) rather than
+   * a copy of anything.
+   *
+   * Intended as a debugging affordance: when a decoded verdict looks wrong, the
+   * raw event is what you attach to an SDK bug report. Pair it with
+   * `guardEventsFromDiagnostics(events, guard, { includeRaw: true })` for offline
+   * analysis of a captured simulation.
+   */
+  includeRaw?: boolean;
 }
 
 function decodeData(value: unknown): unknown {
@@ -281,7 +321,9 @@ function interpret(
 export function diagnosticsToEvents(
   diagnosticEvents: readonly unknown[],
   guard?: string,
+  options?: GuardEventDecodeOptions,
 ): GuardEvent[] {
+  const includeRaw = options?.includeRaw === true;
   const out: GuardEvent[] = [];
   for (const [index, raw] of diagnosticEvents.entries()) {
     const bare = (raw as { event?: unknown }).event ?? raw;
@@ -297,6 +339,9 @@ export function diagnosticsToEvents(
       // The position within this batch is what keeps two blocked decisions from
       // one simulation apart once both are rolled back and neither has a hash.
       simulationIndex: index,
+      // The host-shaped wrapper is the source object here, not `bare`: it is
+      // exactly what the RPC returned and what a bug report needs to include.
+      ...(includeRaw ? { raw } : {}),
     });
     if (decoded) out.push(decoded);
   }
@@ -316,8 +361,9 @@ export function diagnosticsToEvents(
 export function guardEventsFromDiagnostics(
   diagnosticEvents: readonly unknown[],
   guard?: string,
+  options?: GuardEventDecodeOptions,
 ): GuardEvent[] {
-  return diagnosticsToEvents(diagnosticEvents, guard);
+  return diagnosticsToEvents(diagnosticEvents, guard, options);
 }
 
 /**
@@ -512,10 +558,37 @@ export interface GuardTelemetryConfig {
   /** RPC URL, only used for error messages. */
   rpcUrl?: string;
   /**
+   * Optional log sink for this listener's diagnostics: a summary of every page
+   * received (with how many events were dropped as unrecognised), a coverage
+   * gap, and a poll that failed or was aborted.
+   *
+   * Omitted — the default — the listener says nothing at all.
+   */
+  logger?: GuardLoggerInput | undefined;
+  /**
    * Opt-in: retain the most recent events for `recent()` snapshots (issue #68).
    * Omitted → no buffer is allocated and `recent()` always returns `[]`.
    */
   buffer?: GuardEventBufferOptions;
+  /**
+   * Opt-in: attach the raw `rpc.Api.EventResponse` to every committed event
+   * decoded by `poll()`/`watch()`/`watchAll()` (issue #94). Default `false`.
+   *
+   * Diagnostic events decoded by the caller (`guardEventsFromDiagnostics` /
+   * `telemetryFromDecision`) take their own `includeRaw` option, so the two
+   * halves of the unified stream are independent: a consumer can retain the raw
+   * payload for the committed feed, the diagnostic feed, or both.
+   *
+   * Memory: see `GuardEvent.raw`.
+   */
+  includeRaw?: boolean;
+  /**
+   * Opt-in: a cursor store adapter that persists the watch cursor across
+   * listener restarts. Without one, a restart resumes from the head (skipping
+   * events emitted while the process was dead) or replays history (if
+   * `startLedger` is used).
+   */
+  cursorStore?: CursorStore;
 }
 
 export interface PollResult {
@@ -885,8 +958,28 @@ export async function* mergeGuardEventStreams(
   }
 }
 
+export interface CursorStore {
+  save(cursor: string): Promise<void>;
+  load(): Promise<string | null>;
+}
+
+export class InMemoryCursorStore implements CursorStore {
+  private cursor: string | null = null;
+  async save(cursor: string): Promise<void> {
+    this.cursor = cursor;
+  }
+  async load(): Promise<string | null> {
+    return this.cursor;
+  }
+}
+
 export class GuardTelemetryListener {
   private readonly config: GuardTelemetryConfig;
+  private readonly logger: GuardLogger;
+
+  /** The persistence adapter this listener is using (defaults to in-memory). */
+  readonly activeCursorStore: CursorStore;
+
   /**
    * Null unless `config.buffer` is set: with no buffer requested, there is no
    * structure to allocate and every `recent()` call short-circuits (issue #68).
@@ -920,7 +1013,9 @@ export class GuardTelemetryListener {
 
   constructor(config: GuardTelemetryConfig) {
     this.config = config;
+    this.logger = resolveLogger(config.logger);
     this.buffer = config.buffer ? new GuardEventRingBuffer(config.buffer.max) : null;
+    this.activeCursorStore = config.cursorStore ?? new InMemoryCursorStore();
   }
 
   /**
@@ -1058,6 +1153,11 @@ export class GuardTelemetryListener {
 
     const response = await this.config.server.getEvents(request);
     const events: GuardEvent[] = [];
+    // Kept rather than merely skipped: an event this listener cannot interpret
+    // is a coverage fact a host may need to see, and counting it is the only
+    // way to tell "the guard was quiet" from "the guard spoke in a vocabulary
+    // this SDK version does not know".
+    let dropped = 0;
     for (const event of response.events) {
       const contractId = event.contractId ? String(event.contractId) : null;
       const decoded = interpret(
@@ -1073,10 +1173,22 @@ export class GuardTelemetryListener {
           // Committed events anchor on the transaction hash, not on a position
           // within a page: a page boundary would otherwise change an event's id.
           simulationIndex: null,
+          // `includeRaw` is off unless the listener was constructed with it, so
+          // the default path keeps discarding the RPC object (issue #94).
+          ...(this.config.includeRaw ? { raw: event } : {}),
         },
       );
       if (decoded) events.push(decoded);
+      else dropped += 1;
     }
+    const oldestLedger = typeof response.oldestLedger === "number" ? response.oldestLedger : null;
+    this.logger.debug("telemetry page received", {
+      guard: this.config.guard,
+      events: events.length,
+      dropped,
+      latestLedger: response.latestLedger,
+      oldestLedger,
+    });
     this.record(events);
     return {
       events,
@@ -1084,7 +1196,7 @@ export class GuardTelemetryListener {
       latestLedger: response.latestLedger,
       // Best-effort: a host that omits the retention boundary gets no gap
       // detection, rather than a boundary invented from `latestLedger`.
-      oldestLedger: typeof response.oldestLedger === "number" ? response.oldestLedger : null,
+      oldestLedger,
     };
   }
 
@@ -1127,6 +1239,10 @@ export class GuardTelemetryListener {
     // start ledger. Teardown gets no requests at all, not one.
     if (signal?.aborted) return;
 
+    if (cursor === undefined && startLedger === undefined) {
+      cursor = (await this.activeCursorStore.load()) ?? undefined;
+    }
+
     // `expectedFrom` is the earliest ledger the listener has not yet confirmed
     // coverage through: `startLedger` for a fresh range request, or the ledger
     // *after* a resumed cursor. `null` means "cannot be known", in which case gap
@@ -1158,7 +1274,12 @@ export class GuardTelemetryListener {
         // rejection of the request it arrived during. That is teardown, not a
         // telemetry failure: end the stream quietly instead of throwing at the
         // `for await` consumer or leaving an unhandled rejection behind.
-        if (signal?.aborted) return;
+        if (signal?.aborted) {
+          this.logger.debug("telemetry watch aborted with a request in flight", {
+            guard: this.config.guard,
+          });
+          return;
+        }
         // Bounded retry with backoff, then a fail-visible end: call
         // `onStreamError` once with the terminal error and complete the
         // iterator normally. A callback that throws propagates (the consumer
@@ -1185,6 +1306,10 @@ export class GuardTelemetryListener {
           }
         }
         if (recovered === null) {
+          this.logger.warn(
+            `telemetry poll failed: ${terminal instanceof Error ? terminal.message : String(terminal)}`,
+            { guard: this.config.guard },
+          );
           this.lastError = terminal;
           if (params.onStreamError) params.onStreamError(terminal);
           return;
@@ -1230,6 +1355,13 @@ export class GuardTelemetryListener {
           retainedFromLedger: page.oldestLedger,
           retainedToLedger: page.latestLedger,
         };
+        // Also reported through the logger, because `onGap` is only wired when a
+        // caller supplies it and a pruned range is worth seeing in a log even
+        // for a listener that did not ask for a callback.
+        this.logger.warn(
+          `telemetry coverage gap: ledgers ${gap.fromLedger}-${gap.toLedger} are no longer retained by the RPC`,
+          { ...gap, guard: this.config.guard },
+        );
         try {
           params.onGap(gap);
         } catch {
@@ -1239,6 +1371,9 @@ export class GuardTelemetryListener {
       }
 
       const events = [...page.events, ...failedTxEvents];
+
+      await this.activeCursorStore.save(page.cursor);
+      
       if (events.length > 0) yield events;
 
       // Advance confirmed coverage. A page that reached the RPC's head confirms
@@ -1308,9 +1443,10 @@ export class GuardTelemetryListener {
 export function telemetryFromDecision(
   decision: { kind: string; diagnosticEvents?: unknown[]; reason?: string },
   guard: string,
+  options?: GuardEventDecodeOptions,
 ): GuardEvent[] {
   if (decision.kind !== "blocked" || !decision.diagnosticEvents) return [];
-  return diagnosticsToEvents(decision.diagnosticEvents, guard);
+  return diagnosticsToEvents(decision.diagnosticEvents, guard, options);
 }
 
 /** True when a decoded decision means the guard permitted the action. */
